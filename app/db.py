@@ -27,6 +27,12 @@
 完整展开位数自动放大，不读不写线程全局 Decimal 上下文。FastAPI 工作线程默认
 28 位精度下，大额发票（如 30 位整数净额）的收款、分次冲销与当前/历史余额
 依然精确到币种最小单位：余额不丢分位，大额量化不抛 ``InvalidOperation``。
+
+混合保存精度（同币种发票以不同 ``currency_digits`` 入库）下，应收账龄汇总与
+期间税额归集两个汇总遵循同一口径：每张发票仍按自己的入库精度计算未收额/行金额；
+同币种账龄桶、同币种同税率税额组在 Decimal 累加后，以该组**实际参与记录中最高的
+入库小数位**格式化金额并返回相应 ``currency_digits``（税额组的参与记录含贷项
+凭证行），查询结果不受插入顺序影响。
 """
 
 from __future__ import annotations
@@ -1830,8 +1836,15 @@ def receivables_aging_summary(
     每张纳入发票的**全部未收额只进入一个账龄桶**（见 :func:`_aging_bucket`）。
     按发票币种分别汇总、**不跨币种相加**：返回按币种代码升序排列的列表，每个
     币种给出总未收额与六个桶各自的发票数、未收合计（空桶也返回 0）。金额一律
-    在 Python 侧用 Decimal 按该币种最小单位取整后输出十进制字符串，不走 SQLite
-    浮点聚合。
+    在 Python 侧用 Decimal 取整后输出十进制字符串，不走 SQLite 浮点聚合。
+
+    **混合精度**：同币种发票可能以不同 ``currency_digits`` 入库（币种精度配置
+    变更后旧发票保留旧位数）。每张发票的未收额仍按**其自身入库精度**计算；
+    同币种账龄桶在 Decimal 累加后，以该币种**实际参与发票中最高的入库小数位**
+    格式化金额，``currency_digits`` 同样返回该最高位数——各发票未收额都是自身
+    最小单位的整数倍，必然也是组内最细单位的整数倍，格式化不再发生舍入，
+    各桶合计与总未收额恒等，且结果与发票插入顺序无关（不会沿用首条记录的
+    精度把合计 1.55 显示成 2）。
     """
 
     cutoff_text = f"{as_of.isoformat()}T23:59:59Z"
@@ -1845,7 +1858,8 @@ def receivables_aging_summary(
 
     paid_map = _paid_totals_as_of(conn, [int(r["id"]) for r in rows], cutoff_text)
 
-    # 每个币种维护：币种位数、总未收额、各桶发票数与未收合计
+    # 每个币种维护：币种位数（组内实际参与发票的最高入库小数位）、
+    # 总未收额、各桶发票数与未收合计
     digits_by_currency: dict[str, int] = {}
     total_outstanding: dict[str, Decimal] = {}
     invoice_counts: dict[str, int] = {}
@@ -1861,6 +1875,10 @@ def receivables_aging_summary(
             bucket_amounts[currency] = {
                 key: Decimal("0") for key in AGING_BUCKET_KEYS
             }
+        elif digits > digits_by_currency[currency]:
+            # 同币种混合精度：组精度取实际参与发票中最高的入库小数位，
+            # 与发票插入顺序无关（首条记录是 0 位发票也不会拉低组精度）
+            digits_by_currency[currency] = digits
 
     grosses = [Decimal(r["total_gross"]) for r in rows]
     currencies: list[dict[str, Any]] = []
@@ -1944,9 +1962,17 @@ def tax_ledger_summary(
     ``0.130`` 同组），不同币种绝不合并。金额只取发票行的**原币列**
     （``net/tax/gross``），不读取 ``conv_*`` 换算列；逐行在 Python 侧用 Decimal
     累计（不走 SQLite 浮点聚合），每组分别给出开票（``invoiced``）、抵减
-    （``credited``）与净额（``net = 开票 − 抵减``）的未税/税/含税金额，最后按该
-    币种最小单位取整。只有本期抵减、本期未开票的分组（凭证对应更早期发票）同样
-    列出。分组固定按币种代码升序、税率**数值**升序排列；期间内无任何行时分组为空。
+    （``credited``）与净额（``net = 开票 − 抵减``）的未税/税/含税金额。只有
+    本期抵减、本期未开票的分组（凭证对应更早期发票）同样列出。分组固定按币种
+    代码升序、税率**数值**升序排列；期间内无任何行时分组为空。
+
+    **混合精度**：同币种同税率组内的发票行与贷项凭证行可能以不同
+    ``currency_digits`` 入库（币种精度配置变更后旧发票保留旧位数）。每行金额
+    仍按各自入库精度存储并参与 Decimal 累加；组内累加完成后，以该组**实际参与
+    记录（发票行与贷项凭证行都计入判定）中最高的入库小数位**格式化金额，
+    ``currency_digits`` 返回该最高位数——各行金额都是自身最小单位的整数倍，
+    必然也是组内最细单位的整数倍，格式化不再发生舍入，
+    ``net = invoiced − credited`` 在该精度下恒成立，且结果与记录顺序无关。
     """
 
     period_start = f"{start.isoformat()}T00:00:00Z"
@@ -1979,7 +2005,8 @@ def tax_ledger_summary(
         (period_start, period_end),
     ).fetchall()
 
-    # key=(币种, 规范税率文本) -> 累加器；金额逐行 Decimal 求和，不使用浮点聚合
+    # key=(币种, 规范税率文本) -> 累加器；金额逐行 Decimal 求和，不使用浮点聚合；
+    # currency_digits 记录组内实际参与记录（发票行与贷项凭证行）的最高入库小数位
     accum: dict[tuple[str, str], dict[str, Any]] = {}
 
     def _accumulate(rows: list[sqlite3.Row], side: str) -> None:
@@ -1998,6 +2025,10 @@ def tax_ledger_summary(
                     "credited": [Decimal("0"), Decimal("0"), Decimal("0")],
                 }
                 accum[key] = bucket
+            elif digits > bucket["currency_digits"]:
+                # 同币种同税率混合精度：组精度取参与记录的最高入库小数位，
+                # 与记录顺序无关（贷项凭证行经同一函数进入，同样参与判定）
+                bucket["currency_digits"] = digits
             amounts = bucket[side]
             amounts[0] += Decimal(r["net"])
             amounts[1] += Decimal(r["tax"])

@@ -3398,6 +3398,145 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(ov["payment_count"], 1)
         self.assertEqual(ov["paid_total"], "100.00")
 
+    def test_50_mixed_digits_aging_and_tax_ledger(self) -> None:
+        # 混合保存精度：同币种 0 位与 2 位发票共存时，应收账龄汇总与期间税额
+        # 归集不再沿用首条记录的精度，而是按组内实际参与记录的最高入库小数位
+        # 格式化（合计 1.55 不再显示成 2），结果不受插入顺序影响。
+        # AUD：先 0 位后 2 位（题目场景）；CAD：先 2 位后 0 位（对照组）；
+        # NZD：发票行全 0 位，仅贷项凭证行为 2 位（凭证行参与组精度判定）。
+        import sqlite3
+        from decimal import Decimal
+
+        db_file = os.environ["DB_PATH"]
+
+        def set_time(table: str, row_id: int, ts: str) -> None:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    f"UPDATE {table} SET created_at = ? WHERE id = ?", (ts, row_id)
+                )
+                c.commit()
+            finally:
+                c.close()
+
+        def make(currency: str, net: str, ts: str) -> int:
+            status, inv = self._request(
+                "POST",
+                "/api/v1/invoices",
+                {"currency": currency, "lines": [{"net": net, "tax_rate": "0"}]},
+            )
+            self.assertEqual(status, 201, inv)
+            set_time("invoices", inv["id"], ts)
+            return inv["id"]
+
+        old_env = os.environ.get("CURRENCY_DIGITS")
+        try:
+            # 0 位发票（模拟精度配置变更前入库的旧发票）
+            os.environ["CURRENCY_DIGITS"] = "AUD:0,CAD:0,NZD:0"
+            aud_zero = make("AUD", "1", "2033-03-05T00:00:00Z")    # 未收 1
+            nzd_zero = make("NZD", "5", "2033-03-05T00:00:00Z")    # 未收 5
+            # 2 位发票（精度配置变更后入库）
+            os.environ["CURRENCY_DIGITS"] = "AUD:2,CAD:2,NZD:2"
+            aud_two = make("AUD", "0.55", "2033-03-06T00:00:00Z")  # 未收 0.55
+            cad_two = make("CAD", "0.55", "2033-03-06T00:00:00Z")  # 未收 0.55
+            nzd_two = make("NZD", "1.00", "2033-02-10T00:00:00Z")  # 期间外开票
+            # CAD 对照组：0 位发票后插入
+            os.environ["CURRENCY_DIGITS"] = "AUD:0,CAD:0,NZD:0"
+            cad_zero = make("CAD", "2", "2033-03-07T00:00:00Z")    # 未收 2
+        finally:
+            if old_env is None:
+                os.environ.pop("CURRENCY_DIGITS", None)
+            else:
+                os.environ["CURRENCY_DIGITS"] = old_env
+
+        # 对期间外开票的 2 位 NZD 发票开贷项凭证，凭证创建于 2033-03 期间内
+        status, memo = self._request(
+            "POST",
+            f"/api/v1/invoices/{nzd_two}/credit-memos",
+            {"lines": [{"line_no": 1, "net": "0.50"}]},
+        )
+        self.assertEqual(status, 201, memo)
+        set_time("credit_memos", memo["id"], "2033-03-15T00:00:00Z")
+
+        # ---- 应收账龄汇总：as_of 之后于全部发票创建时间，均落入 no_due_date 桶
+        status, body = self._request(
+            "GET", "/api/v1/receivables/aging?as_of=2033-04-01"
+        )
+        self.assertEqual(status, 200, body)
+        by_ccy = {c["currency"]: c for c in body["currencies"]}
+
+        # AUD：首条记录为 0 位（未收 1）、次条 2 位（未收 0.55）：
+        # 修复前沿用首条 0 位精度把合计 1.55 显示成 2；修复后按组内最高位数
+        aud = by_ccy["AUD"]
+        self.assertEqual(aud["currency_digits"], 2)
+        self.assertEqual(aud["invoice_count"], 2)
+        self.assertEqual(aud["total_outstanding"], "1.55")
+        bk = {b["bucket"]: b for b in aud["buckets"]}
+        self.assertEqual(bk["no_due_date"]["invoice_count"], 2)
+        self.assertEqual(bk["no_due_date"]["outstanding"], "1.55")
+
+        # CAD：插入顺序相反（先 2 位 0.55、后 0 位 2），结果与 AUD 同一口径
+        cad = by_ccy["CAD"]
+        self.assertEqual(cad["currency_digits"], 2)
+        self.assertEqual(cad["invoice_count"], 2)
+        self.assertEqual(cad["total_outstanding"], "2.55")
+
+        # NZD：0 位 5 + 2 位 1.00（贷项凭证不影响未收额）
+        nzd = by_ccy["NZD"]
+        self.assertEqual(nzd["currency_digits"], 2)
+        self.assertEqual(nzd["invoice_count"], 2)
+        self.assertEqual(nzd["total_outstanding"], "6.00")
+
+        # 各桶未收之和 == 币种总未收（同一组精度下恒等）
+        for block in (aud, cad, nzd):
+            self.assertEqual(
+                sum(Decimal(b["outstanding"]) for b in block["buckets"]),
+                Decimal(block["total_outstanding"]),
+            )
+
+        # ---- 期间税额归集：2033-03 期间（nzd_two 期间外开票，不计入 invoiced）
+        status, body = self._request(
+            "GET", "/api/v1/tax-ledger?start=2033-03-01&end=2033-03-31"
+        )
+        self.assertEqual(status, 200, body)
+        groups = {(g["currency"], g["tax_rate"]): g for g in body["groups"]}
+        self.assertEqual(len(groups), 3)
+
+        aud = groups[("AUD", "0")]
+        self.assertEqual(aud["currency_digits"], 2)
+        self.assertEqual(
+            aud["invoiced"], {"net": "1.55", "tax": "0.00", "gross": "1.55"}
+        )
+        self.assertEqual(
+            aud["credited"], {"net": "0.00", "tax": "0.00", "gross": "0.00"}
+        )
+        self.assertEqual(aud["net"], {"net": "1.55", "tax": "0.00", "gross": "1.55"})
+
+        cad = groups[("CAD", "0")]
+        self.assertEqual(cad["currency_digits"], 2)
+        self.assertEqual(
+            cad["invoiced"], {"net": "2.55", "tax": "0.00", "gross": "2.55"}
+        )
+
+        # NZD：发票行只有 0 位的 5，但 2 位贷项凭证行把组精度抬到 2 位
+        nzd = groups[("NZD", "0")]
+        self.assertEqual(nzd["currency_digits"], 2)
+        self.assertEqual(
+            nzd["invoiced"], {"net": "5.00", "tax": "0.00", "gross": "5.00"}
+        )
+        self.assertEqual(
+            nzd["credited"], {"net": "0.50", "tax": "0.00", "gross": "0.50"}
+        )
+        self.assertEqual(nzd["net"], {"net": "4.50", "tax": "0.00", "gross": "4.50"})
+
+        # 每组净额 == 开票 − 抵减（未税/税/含税各列）
+        for g in body["groups"]:
+            for col in ("net", "tax", "gross"):
+                self.assertEqual(
+                    Decimal(g["net"][col]),
+                    Decimal(g["invoiced"][col]) - Decimal(g["credited"][col]),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
