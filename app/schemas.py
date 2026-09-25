@@ -478,7 +478,11 @@ class AgingBucketOut(BaseModel):
 
 
 class AgingCurrencyOut(BaseModel):
-    """单个币种的账龄汇总：各桶发票数/未收合计与该币种总未收额，不跨币种相加。"""
+    """单个币种的账龄汇总：各桶发票数/未收合计与该币种总未收额，不跨币种相加。
+
+    混合保存精度下，``currency_digits`` 为该币种全部参与发票的最高入库小数位，
+    合计按其格式化；非空桶可按本桶参与发票的最高位数展示（空桶沿用币种位数）。
+    """
 
     model_config = ConfigDict(extra="allow")
     currency: str
@@ -765,7 +769,11 @@ class TaxLedgerAmounts(BaseModel):
 
 
 class TaxLedgerGroup(BaseModel):
-    """原币种 + 原发票行税率下的期间开票、抵减与净额（net = invoiced − credited）。"""
+    """原币种 + 原发票行税率下的期间开票、抵减与净额（net = invoiced − credited）。
+
+    混合保存精度下，``currency_digits`` 为该组全部参与记录（发票行与贷项凭证行）
+    的最高入库小数位，开票/抵减/净额均按其格式化，结果与插入顺序无关。
+    """
 
     model_config = ConfigDict(extra="allow")
     currency: str

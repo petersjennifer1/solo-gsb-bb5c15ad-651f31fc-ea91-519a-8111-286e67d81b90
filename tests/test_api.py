@@ -3398,6 +3398,254 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(ov["payment_count"], 1)
         self.assertEqual(ov["paid_total"], "100.00")
 
+    def test_50_aging_and_ledger_mixed_precision_order_independent(self) -> None:
+        # 同币种混合入库精度（币种精度配置变更后旧 0 位 + 新 2 位共存）：
+        # 每张发票按自己的入库精度算未收额；账龄桶/币种合计与税额组在 Decimal
+        # 累加后按**该组实际参与记录的最高入库小数位**格式化并回显 currency_digits。
+        # XBA 先 0 位后 2 位、XBB 先 2 位后 0 位（插入顺序相反）：两组数据同构，
+        # 结果必须一致（与插入顺序无关），合计 0.81 不得被抹成 "1"。
+        import sqlite3
+        from decimal import Decimal
+
+        db_file = os.environ["DB_PATH"]
+
+        def set_time(table: str, row_id: int, ts: str) -> None:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    f"UPDATE {table} SET created_at = ? WHERE id = ?", (ts, row_id)
+                )
+                c.commit()
+            finally:
+                c.close()
+
+        def invoice(code: str, net: str, rate: str, ts: str,
+                    due: str | None = None) -> int:
+            payload = {"currency": code,
+                       "lines": [{"net": net, "tax_rate": rate}]}
+            if due is not None:
+                payload["due_date"] = due
+            status, body = self._request("POST", "/api/v1/invoices", payload)
+            self.assertEqual(status, 201, body)
+            set_time("invoices", body["id"], ts)
+            return body["id"]
+
+        def pay(invoice_id: int, amount: str, ts: str) -> None:
+            status, body = self._request(
+                "POST", f"/api/v1/invoices/{invoice_id}/payments",
+                {"amount": amount},
+            )
+            self.assertEqual(status, 201, body)
+            set_time("payments", body["id"], ts)
+
+        old_env = os.environ.get("CURRENCY_DIGITS")
+        os.environ["CURRENCY_DIGITS"] = "XBA:0,XBB:2"
+        try:
+            # 阶段 1：XBA 按 0 位、XBB 按 2 位保存
+            # 无到期日 @10%：XBA gross 11；XBB gross 2.81（随后部分收款 2.00）
+            a0 = invoice("XBA", "10", "0.10", "2032-01-10T00:00:00Z")
+            b2 = invoice("XBB", "2.55", "0.10", "2032-01-10T00:00:00Z")
+            pay(b2, "2.00", "2032-01-11T00:00:00Z")  # XBB 余 0.81
+            # 有到期日 @0%：只进逾期桶，用于验证**桶级**位数（0 位桶出 "5"）
+            invoice("XBA", "5", "0", "2032-01-10T00:00:00Z", due="2032-02-01")
+            invoice("XBB", "5.00", "0", "2032-01-10T00:00:00Z", due="2032-02-01")
+            self.assertEqual(self._request("GET", f"/api/v1/invoices/{a0}")[1]
+                             ["currency_digits"], 0)
+
+            # 阶段 2：精度配置翻转——XBA 按 2 位、XBB 按 0 位保存
+            os.environ["CURRENCY_DIGITS"] = "XBA:2,XBB:0"
+            a2 = invoice("XBA", "2.55", "0.10", "2032-01-12T00:00:00Z")
+            pay(a2, "2.00", "2032-01-13T00:00:00Z")  # XBA 余 0.81
+            invoice("XBB", "10", "0.10", "2032-01-12T00:00:00Z")
+            self.assertEqual(self._request("GET", f"/api/v1/invoices/{a2}")[1]
+                             ["currency_digits"], 2)
+        finally:
+            if old_env is None:
+                os.environ.pop("CURRENCY_DIGITS", None)
+            else:
+                os.environ["CURRENCY_DIGITS"] = old_env
+
+        # ---- 应收账龄汇总 ----
+        status, body = self._request(
+            "GET", "/api/v1/receivables/aging?as_of=2032-03-01"
+        )
+        self.assertEqual(status, 200, body)
+        by_ccy = {c["currency"]: c for c in body["currencies"]}
+        self.assertIn("XBA", by_ccy)
+        self.assertIn("XBB", by_ccy)
+
+        expected_no_due = "11.81"   # 11 + 0.81，不得舍成 "12"
+        for code, overdue_text in (("XBA", "5"), ("XBB", "5.00")):
+            block = by_ccy[code]
+            # 组精度为参与记录最高位数（2），与插入顺序无关
+            self.assertEqual(block["currency_digits"], 2, code)
+            self.assertEqual(block["invoice_count"], 3, code)
+            self.assertEqual(block["total_outstanding"], "16.81", code)
+            bk = {b["bucket"]: b for b in block["buckets"]}
+            self.assertEqual(bk["no_due_date"]["invoice_count"], 2, code)
+            self.assertEqual(bk["no_due_date"]["outstanding"], expected_no_due, code)
+            # 桶级位数：XBA 该桶只有 0 位发票 -> "5"；XBB 2 位 -> "5.00"
+            self.assertEqual(bk["overdue_1_30"]["invoice_count"], 1, code)
+            self.assertEqual(bk["overdue_1_30"]["outstanding"], overdue_text, code)
+            # 空桶沿用币种位数（2 位）
+            self.assertEqual(bk["current"]["outstanding"], "0.00", code)
+            # 桶未收之和（Decimal）恒等于币种总未收
+            self.assertEqual(
+                sum(Decimal(b["outstanding"]) for b in block["buckets"]),
+                Decimal("16.81"),
+                code,
+            )
+            self.assertEqual(
+                sum(b["invoice_count"] for b in block["buckets"]), 3, code
+            )
+
+        # ---- 期间税额归集 ----
+        status, body = self._request(
+            "GET", "/api/v1/tax-ledger?start=2032-01-01&end=2032-01-31"
+        )
+        self.assertEqual(status, 200, body)
+        groups = {
+            (g["currency"], g["tax_rate"]): g
+            for g in body["groups"]
+            if g["currency"] in ("XBA", "XBB")
+        }
+        # @0% 组只有各币种的有到期日发票：组位数即该发票入库位数
+        self.assertEqual(groups[("XBA", "0")]["currency_digits"], 0)
+        self.assertEqual(
+            groups[("XBA", "0")]["invoiced"],
+            {"net": "5", "tax": "0", "gross": "5"},
+        )
+        self.assertEqual(groups[("XBB", "0")]["currency_digits"], 2)
+        self.assertEqual(
+            groups[("XBB", "0")]["invoiced"],
+            {"net": "5.00", "tax": "0.00", "gross": "5.00"},
+        )
+        # @10% 组：0 位行 + 2 位行，两种插入顺序结果完全一致
+        for code in ("XBA", "XBB"):
+            g = groups[(code, "0.1")]
+            self.assertEqual(g["currency_digits"], 2, code)
+            self.assertEqual(
+                g["invoiced"],
+                {"net": "12.55", "tax": "1.26", "gross": "13.81"},
+                code,
+            )
+            self.assertEqual(
+                g["credited"],
+                {"net": "0.00", "tax": "0.00", "gross": "0.00"},
+                code,
+            )
+            self.assertEqual(
+                g["net"],
+                {"net": "12.55", "tax": "1.26", "gross": "13.81"},
+                code,
+            )
+            for col in ("net", "tax", "gross"):
+                self.assertEqual(
+                    Decimal(g["net"][col]),
+                    Decimal(g["invoiced"][col]) - Decimal(g["credited"][col]),
+                    (code, col),
+                )
+
+    def test_51_tax_ledger_credit_memo_lines_set_group_digits(self) -> None:
+        # 贷项凭证行参与税额组精度判定：组内开票行全是 0 位、本期抵减凭证来自
+        # 2 位精度发票时，整组（含 invoiced/credited/net）按 2 位展示，抵减额
+        # 0.10/0.01 不得被抹成 0。XMC/XMD 插入顺序相反，结果一致。
+        import sqlite3
+        from decimal import Decimal
+
+        db_file = os.environ["DB_PATH"]
+
+        def set_time(table: str, row_id: int, ts: str) -> None:
+            c = sqlite3.connect(db_file, timeout=30)
+            try:
+                c.execute(
+                    f"UPDATE {table} SET created_at = ? WHERE id = ?", (ts, row_id)
+                )
+                c.commit()
+            finally:
+                c.close()
+
+        def setup(code: str, first_digits: int) -> None:
+            # first_digits=0：先 0 位（5 月开票）后 2 位（6 月开票 + 5 月凭证）；
+            # first_digits=2：顺序相反
+            def make(net: str) -> int:
+                status, body = self._request(
+                    "POST",
+                    "/api/v1/invoices",
+                    {"currency": code,
+                     "lines": [{"net": net, "tax_rate": "0.10"}]},
+                )
+                self.assertEqual(status, 201, body)
+                return body["id"]
+
+            def memo(iid: int, net: str) -> dict:
+                status, body = self._request(
+                    "POST", f"/api/v1/invoices/{iid}/credit-memos",
+                    {"lines": [{"line_no": 1, "net": net}]},
+                )
+                self.assertEqual(status, 201, body)
+                return body
+
+            order = [0, 2] if first_digits == 0 else [2, 0]
+            ids: dict[int, int] = {}
+            for i, digits in enumerate(order):
+                os.environ["CURRENCY_DIGITS"] = f"{code}:{digits}"
+                if digits == 0:
+                    iid = make("10")                 # 0 位：5 月开票
+                    set_time("invoices", iid, "2033-05-10T00:00:00Z")
+                else:
+                    iid = make("2.00")               # 2 位：6 月开票
+                    set_time("invoices", iid, "2033-06-05T00:00:00Z")
+                    m = memo(iid, "0.10")            # 凭证抵 0.10（税 0.01）
+                    self.assertEqual(
+                        (m["lines"][0]["net"], m["lines"][0]["tax"]),
+                        ("0.10", "0.01"),
+                    )
+                    # 凭证创建在 5 月：抵减计入 5 月台账（原发票 6 月才开票）
+                    set_time("credit_memos", m["id"], "2033-05-20T00:00:00Z")
+                ids[digits] = iid
+
+        old_env = os.environ.get("CURRENCY_DIGITS")
+        try:
+            setup("XMC", first_digits=0)
+            setup("XMD", first_digits=2)
+        finally:
+            if old_env is None:
+                os.environ.pop("CURRENCY_DIGITS", None)
+            else:
+                os.environ["CURRENCY_DIGITS"] = old_env
+
+        status, body = self._request(
+            "GET", "/api/v1/tax-ledger?start=2033-05-01&end=2033-05-31"
+        )
+        self.assertEqual(status, 200, body)
+        for code in ("XMC", "XMD"):
+            g = next(g for g in body["groups"]
+                     if g["currency"] == code and g["tax_rate"] == "0.1")
+            # 凭证行（2 位）把整组位数抬到 2，即使本期开票行全是 0 位
+            self.assertEqual(g["currency_digits"], 2, code)
+            self.assertEqual(
+                g["invoiced"],
+                {"net": "10.00", "tax": "1.00", "gross": "11.00"},
+                code,
+            )
+            self.assertEqual(
+                g["credited"],
+                {"net": "0.10", "tax": "0.01", "gross": "0.11"},
+                code,
+            )
+            self.assertEqual(
+                g["net"],
+                {"net": "9.90", "tax": "0.99", "gross": "10.89"},
+                code,
+            )
+            for col in ("net", "tax", "gross"):
+                self.assertEqual(
+                    Decimal(g["net"][col]),
+                    Decimal(g["invoiced"][col]) - Decimal(g["credited"][col]),
+                    (code, col),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

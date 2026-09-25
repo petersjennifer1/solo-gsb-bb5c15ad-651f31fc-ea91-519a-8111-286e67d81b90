@@ -27,6 +27,13 @@
 完整展开位数自动放大，不读不写线程全局 Decimal 上下文。FastAPI 工作线程默认
 28 位精度下，大额发票（如 30 位整数净额）的收款、分次冲销与当前/历史余额
 依然精确到币种最小单位：余额不丢分位，大额量化不抛 ``InvalidOperation``。
+
+跨发票的两类汇总（应收账龄汇总、期间税额归集）面临**混合保存精度**：同一币种
+代码下各发票持久化的 ``currency_digits`` 可能不同（币种精度配置变更后旧发票
+保留旧位数）。口径统一为：每张发票/每行只按**自身入库精度**计算并以 Decimal
+原样累加，输出时才按**该组实际参与记录中最高的入库小数位**格式化（账龄桶取
+落桶发票、税额组取组内发票行与贷项凭证行），组精度取 ``max`` 而非首条记录的
+位数，因此查询结果与插入顺序无关。
 """
 
 from __future__ import annotations
@@ -1829,9 +1836,16 @@ def receivables_aging_summary(
 
     每张纳入发票的**全部未收额只进入一个账龄桶**（见 :func:`_aging_bucket`）。
     按发票币种分别汇总、**不跨币种相加**：返回按币种代码升序排列的列表，每个
-    币种给出总未收额与六个桶各自的发票数、未收合计（空桶也返回 0）。金额一律
-    在 Python 侧用 Decimal 按该币种最小单位取整后输出十进制字符串，不走 SQLite
-    浮点聚合。
+    币种给出总未收额与六个桶各自的发票数、未收合计（空桶也返回 0）。
+
+    **混合保存精度**：同一币种代码下各发票的入库小数位可能不同（币种精度配置
+    变更后旧发票保留旧位数、新发票按新位数保存）。每张发票的未收额仍只按**该
+    发票自己入库时的** ``currency_digits`` 计算（含税总额与净入账都在该发票单位
+    上取整），绝不用其他发票的位数舍入；随后在 Python 侧用 Decimal 原样累加，
+    输出时才按**该组实际参与发票中最高的入库小数位**格式化——币种合计与回显的
+    ``currency_digits`` 取该币种全部参与发票的最高位数，单个账龄桶取落入该桶的
+    参与发票最高位数（空桶无参与记录，沿用币种位数）。因此合计既不会把 0.55
+    舍成 1，也与发票插入顺序无关；各桶未收额按 Decimal 求和恒等于币种总未收额。
     """
 
     cutoff_text = f"{as_of.isoformat()}T23:59:59Z"
@@ -1845,29 +1859,35 @@ def receivables_aging_summary(
 
     paid_map = _paid_totals_as_of(conn, [int(r["id"]) for r in rows], cutoff_text)
 
-    # 每个币种维护：币种位数、总未收额、各桶发票数与未收合计
+    # 每个币种维护：参与发票的最高入库位数、总未收额、各桶发票数与未收合计；
+    # 桶位数单独记录为该桶实际参与发票的最高入库位数（空桶沿用币种位数）。
+    # 用 max（而非首条记录的位数）决定组精度，结果不受发票插入顺序影响。
     digits_by_currency: dict[str, int] = {}
     total_outstanding: dict[str, Decimal] = {}
     invoice_counts: dict[str, int] = {}
     bucket_counts: dict[str, dict[str, int]] = {}
     bucket_amounts: dict[str, dict[str, Decimal]] = {}
+    bucket_digits: dict[str, dict[str, int]] = {}
 
-    def _ensure_currency(currency: str, digits: int) -> None:
+    def _ensure_currency(currency: str) -> None:
         if currency not in digits_by_currency:
-            digits_by_currency[currency] = digits
+            digits_by_currency[currency] = 0
             total_outstanding[currency] = Decimal("0")
             invoice_counts[currency] = 0
             bucket_counts[currency] = {key: 0 for key in AGING_BUCKET_KEYS}
             bucket_amounts[currency] = {
                 key: Decimal("0") for key in AGING_BUCKET_KEYS
             }
+            bucket_digits[currency] = {key: 0 for key in AGING_BUCKET_KEYS}
 
     grosses = [Decimal(r["total_gross"]) for r in rows]
     currencies: list[dict[str, Any]] = []
     with money_context([*grosses, *paid_map.values()], len(rows)):
         for r, gross in zip(rows, grosses):
             currency = r["currency"]
-            unit = _minor_unit(int(r["currency_digits"]))
+            # 未收额只按该发票自己的入库精度计算，不沿用同币种其他发票的位数
+            digits = int(r["currency_digits"])
+            unit = _minor_unit(digits)
             if gross <= 0:
                 continue
             paid = paid_map.get(int(r["id"]), Decimal("0")).quantize(unit)
@@ -1875,19 +1895,25 @@ def receivables_aging_summary(
             if outstanding <= 0:
                 continue
 
-            _ensure_currency(currency, int(r["currency_digits"]))
+            _ensure_currency(currency)
+            # 组精度随参与记录动态取最高位数，与记录遍历（插入）顺序无关
+            digits_by_currency[currency] = max(digits_by_currency[currency], digits)
             bucket = _aging_bucket(r["due_date"], as_of)
+            bucket_digits[currency][bucket] = max(
+                bucket_digits[currency][bucket], digits
+            )
             total_outstanding[currency] += outstanding
             invoice_counts[currency] += 1
             bucket_counts[currency][bucket] += 1
             bucket_amounts[currency][bucket] += outstanding
 
         for currency in sorted(digits_by_currency):
-            unit = _minor_unit(digits_by_currency[currency])
+            currency_digits = digits_by_currency[currency]
+            unit = _minor_unit(currency_digits)
             currencies.append(
                 {
                     "currency": currency,
-                    "currency_digits": digits_by_currency[currency],
+                    "currency_digits": currency_digits,
                     "invoice_count": invoice_counts[currency],
                     "total_outstanding": format(
                         total_outstanding[currency].quantize(unit), "f"
@@ -1896,8 +1922,17 @@ def receivables_aging_summary(
                         {
                             "bucket": key,
                             "invoice_count": bucket_counts[currency][key],
+                            # 非空桶按该桶参与发票的最高入库位数格式化；
+                            # 空桶无参与记录，沿用币种位数
                             "outstanding": format(
-                                bucket_amounts[currency][key].quantize(unit), "f"
+                                bucket_amounts[currency][key].quantize(
+                                    _minor_unit(
+                                        bucket_digits[currency][key]
+                                        if bucket_counts[currency][key] > 0
+                                        else currency_digits
+                                    )
+                                ),
+                                "f",
                             ),
                         }
                         for key in AGING_BUCKET_KEYS
@@ -1944,9 +1979,18 @@ def tax_ledger_summary(
     ``0.130`` 同组），不同币种绝不合并。金额只取发票行的**原币列**
     （``net/tax/gross``），不读取 ``conv_*`` 换算列；逐行在 Python 侧用 Decimal
     累计（不走 SQLite 浮点聚合），每组分别给出开票（``invoiced``）、抵减
-    （``credited``）与净额（``net = 开票 − 抵减``）的未税/税/含税金额，最后按该
-    币种最小单位取整。只有本期抵减、本期未开票的分组（凭证对应更早期发票）同样
-    列出。分组固定按币种代码升序、税率**数值**升序排列；期间内无任何行时分组为空。
+    （``credited``）与净额（``net = 开票 − 抵减``）的未税/税/含税金额。
+
+    **混合保存精度**：同币种同税率的组可能由不同入库小数位的发票行构成（币种
+    精度配置变更后旧发票保留旧位数、新发票按新位数保存）。各行金额按自身发票
+    入库精度保存并原样 Decimal 累加，输出时按**该组实际参与记录中最高的入库
+    小数位**统一格式化（``currency_digits`` 回显该最高位数）；**贷项凭证行同样
+    参与组精度判定**——即使组内发票行都是 0 位，本期有 2 位精度的凭证抵减时，
+    该组也按 2 位展示，抵减额不会被抹零。组精度由参与记录取 ``max`` 而非沿用
+    首条记录，查询结果与发票/凭证的插入顺序无关；``invoiced`` 与 ``credited``
+    在同一组单位上取整后相减得到 ``net``，三列严格满足 ``net = invoiced −
+    credited``。只有本期抵减、本期未开票的分组（凭证对应更早期发票）同样列出。
+    分组固定按币种代码升序、税率**数值**升序排列；期间内无任何行时分组为空。
     """
 
     period_start = f"{start.isoformat()}T00:00:00Z"
@@ -1979,7 +2023,9 @@ def tax_ledger_summary(
         (period_start, period_end),
     ).fetchall()
 
-    # key=(币种, 规范税率文本) -> 累加器；金额逐行 Decimal 求和，不使用浮点聚合
+    # key=(币种, 规范税率文本) -> 累加器；金额逐行 Decimal 求和，不使用浮点聚合。
+    # currency_digits 保存该组**全部参与记录（发票行与贷项凭证行）中最高的入库
+    # 小数位**，随每次累加取 max：组精度不沿用首条记录，与插入顺序无关。
     accum: dict[tuple[str, str], dict[str, Any]] = {}
 
     def _accumulate(rows: list[sqlite3.Row], side: str) -> None:
@@ -1998,6 +2044,8 @@ def tax_ledger_summary(
                     "credited": [Decimal("0"), Decimal("0"), Decimal("0")],
                 }
                 accum[key] = bucket
+            # 贷项凭证行同样参与精度判定：抵减侧记录的入库位数也会抬升组精度
+            bucket["currency_digits"] = max(bucket["currency_digits"], digits)
             amounts = bucket[side]
             amounts[0] += Decimal(r["net"])
             amounts[1] += Decimal(r["tax"])
